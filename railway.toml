@@ -1,0 +1,10 @@
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "npm start"
+sleepApplication = false
+restartPolicyType = "ON_FAILURE"
+
+# In Railway dashboard: Settings > Volumes > Add Volume, mount path "/data"
+# This is where entries.json will be persisted across deploys/restarts.

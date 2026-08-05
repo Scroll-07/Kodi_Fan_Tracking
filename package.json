@@ -1,0 +1,17 @@
+{
+  "name": "event-checkin",
+  "version": "1.0.0",
+  "description": "QR-code event check-in tracker with Railway Volume storage",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "qrcode": "^1.5.3",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
