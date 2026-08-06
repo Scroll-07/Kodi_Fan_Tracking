@@ -60,6 +60,15 @@ function getEntries() {
   return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
 }
 
+// One row per person (deduped by email, last check-in wins for name/phone/location)
+function uniquePeople(entries) {
+  const map = new Map();
+  entries.forEach(e => {
+    map.set(e.email, { name: e.name, email: e.email, phone: e.phone, city: e.city, state: e.state, country: e.country });
+  });
+  return [...map.values()];
+}
+
 // ---- Basic Auth for /admin ----
 function requireAuth(req, res, next) {
   const auth = req.headers.authorization;
@@ -165,6 +174,9 @@ app.get('/checkin', (req, res) => {
         <div class="field"><label for="name">Full name</label><input id="name" name="name" type="text" required></div>
         <div class="field"><label for="email">Email</label><input id="email" name="email" type="email" required></div>
         <div class="field"><label for="phone">Phone <span class="optional-tag">(optional)</span></label><input id="phone" name="phone" type="tel"></div>
+        <div class="field"><label for="city">City <span class="optional-tag">(optional)</span></label><input id="city" name="city" type="text"></div>
+        <div class="field"><label for="state">State <span class="optional-tag">(optional)</span></label><input id="state" name="state" type="text"></div>
+        <div class="field"><label for="country">Country <span class="optional-tag">(optional)</span></label><input id="country" name="country" type="text"></div>
         <button class="submit" type="submit">Check In</button>
       </form>
       <div class="barcode-wrap"><div class="barcode"></div><span class="status-tag">PENDING</span></div>
@@ -175,13 +187,16 @@ app.get('/checkin', (req, res) => {
 });
 
 app.post('/checkin', async (req, res) => {
-  const { name, email, phone } = req.body;
+  const { name, email, phone, city, state, country } = req.body;
   if (!name || !email) return res.status(400).send('Name and email are required.');
 
   await appendEntry({
     name: name.trim(),
     email: email.trim().toLowerCase(),
     phone: (phone || '').trim(),
+    city: (city || '').trim(),
+    state: (state || '').trim(),
+    country: (country || '').trim(),
     timestamp: new Date().toISOString()
   });
 
@@ -230,9 +245,18 @@ app.get('/admin', requireAuth, (req, res) => {
   const entries = getEntries().slice().reverse();
   const uniqueEmails = new Set(entries.map(e => e.email)).size;
   const phoneCount = new Set(entries.filter(e => e.phone).map(e => normalizePhone(e.phone))).size;
-  const rows = entries.map(e =>
-    `<tr><td>${e.name}</td><td>${e.email}</td><td>${e.phone || ''}</td><td>${new Date(e.timestamp).toLocaleString()}</td></tr>`
-  ).join('');
+  const people = uniquePeople(getEntries()); // chronological, so "last wins" reflects most recent info
+  const rows = entries.map(e => {
+    const location = [e.city, e.state, e.country].filter(Boolean).join(', ');
+    return `<tr><td>${e.name}</td><td>${e.email}</td><td>${e.phone || ''}</td><td>${location}</td><td>${new Date(e.timestamp).toLocaleString()}</td></tr>`;
+  }).join('');
+
+  const peopleCheckboxes = people.map((p, i) => `
+    <label class="recipient-row">
+      <input type="checkbox" name="recipients" value="${p.email}" form="broadcastForm" checked>
+      <span class="recipient-name">${p.name}</span>
+      <span class="recipient-meta">${p.email}${p.phone ? ' · ' + p.phone : ''}${p.city ? ' · ' + p.city : ''}</span>
+    </label>`).join('');
 
   const q = req.query;
   let banner = '';
@@ -241,6 +265,7 @@ app.get('/admin', requireAuth, (req, res) => {
   if (q.smsError === 'not_configured') banner = `<div class="banner err">SMS isn't set up yet — add TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_FROM_NUMBER in Railway Variables.</div>`;
   if (q.emailError === 'not_configured') banner = `<div class="banner err">Email isn't set up yet — add RESEND_API_KEY in Railway Variables.</div>`;
   if (q.smsError === 'empty' || q.emailError === 'empty') banner = `<div class="banner err">Message can't be empty.</div>`;
+  if (q.smsError === 'none_selected' || q.emailError === 'none_selected') banner = `<div class="banner err">No recipients selected — check at least one person below.</div>`;
   if (q.resetDone === '1') banner = `<div class="banner ok">All check-in data has been cleared.</div>`;
   if (q.resetError === 'badpass') banner = `<div class="banner err">Incorrect admin password — data was NOT deleted.</div>`;
 
@@ -259,15 +284,21 @@ app.get('/admin', requireAuth, (req, res) => {
   .banner{padding:12px 16px;border-radius:8px;margin-bottom:20px;font-size:.9rem}
   .banner.ok{background:#e8f7ee;color:#1a7a3f}
   .banner.err{background:#fdecec;color:#a3231b}
-  .broadcast-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:8px}
-  @media (max-width:700px){.broadcast-grid{grid-template-columns:1fr}}
-  .panel{background:#f9f9f7;border:1px solid #e5e3dc;border-radius:12px;padding:18px}
+  .panel{background:#f9f9f7;border:1px solid #e5e3dc;border-radius:12px;padding:18px;margin-top:20px}
   .panel h3{margin:0 0 4px;font-size:.95rem}
   .panel p.hint{margin:0 0 12px;font-size:.78rem;color:#777}
-  .panel input, .panel textarea{width:100%;padding:10px;border:1px solid #ddd;border-radius:8px;font-family:inherit;font-size:.88rem;margin-bottom:10px;box-sizing:border-box}
+  .panel input[type=text], .panel textarea{width:100%;padding:10px;border:1px solid #ddd;border-radius:8px;font-family:inherit;font-size:.88rem;margin-bottom:10px;box-sizing:border-box}
   .panel textarea{min-height:90px;resize:vertical}
-  .panel button{width:100%;padding:11px;border:none;border-radius:8px;background:#111;color:#fff;font-weight:600;font-size:.85rem;cursor:pointer}
-  .panel button:hover{opacity:.9}
+  .recipients-box{max-height:220px;overflow-y:auto;border:1px solid #e3e1d9;border-radius:8px;background:#fff;padding:6px 10px;margin-bottom:14px}
+  .recipient-row{display:flex;align-items:baseline;gap:8px;padding:7px 2px;border-bottom:1px solid #f2f1ec;font-size:.85rem;cursor:pointer}
+  .recipient-row:last-child{border-bottom:none}
+  .recipient-name{font-weight:600}
+  .recipient-meta{color:#888;font-size:.78rem}
+  .select-toggle{display:flex;gap:14px;margin-bottom:10px;font-size:.8rem}
+  .select-toggle a{color:#555;text-decoration:underline;cursor:pointer}
+  .btn-row{display:flex;gap:10px;flex-wrap:wrap}
+  .btn-row button{flex:1;min-width:160px;padding:11px;border:none;border-radius:8px;background:#111;color:#fff;font-weight:600;font-size:.85rem;cursor:pointer}
+  .btn-row button:hover{opacity:.9}
   .danger{background:#fdf3f2;border:1px solid #f3c9c5;border-radius:12px;padding:18px;margin-top:28px}
   .danger h3{margin:0 0 4px;font-size:.95rem;color:#a3231b}
   .danger p.hint{margin:0 0 12px;font-size:.78rem;color:#8a4f4a}
@@ -286,24 +317,25 @@ app.get('/admin', requireAuth, (req, res) => {
   </div>
   <a class="btn" href="/admin/export.csv">Download CSV</a>
 
-  <div class="broadcast-grid">
-    <div class="panel">
-      <h3>Send SMS to everyone</h3>
-      <p class="hint">Goes to every phone number logged (${phoneCount} people). Good for the address, day-of.</p>
-      <form method="POST" action="/admin/broadcast/sms">
-        <textarea name="message" placeholder="e.g. Tonight's address: 123 Main St, Atlanta. Doors at 9pm." required></textarea>
-        <button type="submit">Send SMS to All</button>
-      </form>
+  <div class="panel">
+    <h3>Message recipients</h3>
+    <p class="hint">Check who should get this message — everyone's checked by default. Uncheck to exclude, or uncheck all then pick just one for a single-person test.</p>
+    <div class="select-toggle">
+      <a onclick="document.querySelectorAll('.recipient-row input').forEach(c=>c.checked=true)">Select all</a>
+      <a onclick="document.querySelectorAll('.recipient-row input').forEach(c=>c.checked=false)">Select none</a>
     </div>
-    <div class="panel">
-      <h3>Send email to everyone</h3>
-      <p class="hint">Goes to every email logged (${uniqueEmails} people), sent via Resend.</p>
-      <form method="POST" action="/admin/broadcast/email">
-        <input type="text" name="subject" placeholder="Subject (e.g. Tonight's location)">
-        <textarea name="message" placeholder="Message body..." required></textarea>
-        <button type="submit">Send Email to All</button>
-      </form>
+    <div class="recipients-box">
+      ${peopleCheckboxes || '<p style="color:#999;font-size:.85rem">No check-ins yet.</p>'}
     </div>
+
+    <form id="broadcastForm" method="POST">
+      <input type="text" name="subject" placeholder="Email subject (ignored for SMS) — e.g. Tonight's location">
+      <textarea name="message" placeholder="Message body — used for both SMS and email" required></textarea>
+      <div class="btn-row">
+        <button type="submit" formaction="/admin/broadcast/sms">Send SMS to Selected</button>
+        <button type="submit" formaction="/admin/broadcast/email">Send Email to Selected</button>
+      </div>
+    </form>
   </div>
 
   <div class="danger">
@@ -316,7 +348,7 @@ app.get('/admin', requireAuth, (req, res) => {
   </div>
 
   <table>
-    <tr><th>Name</th><th>Email</th><th>Phone</th><th>Time</th></tr>
+    <tr><th>Name</th><th>Email</th><th>Phone</th><th>Location</th><th>Time</th></tr>
     ${rows}
   </table>
 </body></html>`);
@@ -327,8 +359,15 @@ app.post('/admin/broadcast/sms', requireAuth, async (req, res) => {
   if (!message) return res.redirect('/admin?smsError=empty');
   if (!twilioClient) return res.redirect('/admin?smsError=not_configured');
 
-  const entries = getEntries();
-  const recipients = [...new Set(entries.filter(e => e.phone).map(e => normalizePhone(e.phone)).filter(Boolean))];
+  let selected = req.body.recipients || [];
+  if (!Array.isArray(selected)) selected = [selected];
+  if (selected.length === 0) return res.redirect('/admin?smsError=none_selected');
+
+  const people = uniquePeople(getEntries());
+  const phoneByEmail = new Map(people.map(p => [p.email, p.phone]));
+  const recipients = [...new Set(
+    selected.map(email => normalizePhone(phoneByEmail.get(email))).filter(Boolean)
+  )];
 
   let sent = 0, failed = 0;
   for (const to of recipients) {
@@ -349,8 +388,11 @@ app.post('/admin/broadcast/email', requireAuth, async (req, res) => {
   if (!message) return res.redirect('/admin?emailError=empty');
   if (!resend) return res.redirect('/admin?emailError=not_configured');
 
-  const entries = getEntries();
-  const recipients = [...new Set(entries.map(e => e.email))];
+  let selected = req.body.recipients || [];
+  if (!Array.isArray(selected)) selected = [selected];
+  if (selected.length === 0) return res.redirect('/admin?emailError=none_selected');
+
+  const recipients = [...new Set(selected)];
 
   let sent = 0, failed = 0;
   for (const to of recipients) {
@@ -372,9 +414,10 @@ app.post('/admin/broadcast/email', requireAuth, async (req, res) => {
 
 app.get('/admin/export.csv', requireAuth, (req, res) => {
   const entries = getEntries();
-  const header = 'name,email,phone,timestamp\n';
+  const header = 'name,email,phone,city,state,country,timestamp\n';
   const rows = entries.map(e =>
-    [e.name, e.email, e.phone, e.timestamp].map(v => `"${(v || '').replace(/"/g, '""')}"`).join(',')
+    [e.name, e.email, e.phone, e.city, e.state, e.country, e.timestamp]
+      .map(v => `"${(v || '').replace(/"/g, '""')}"`).join(',')
   ).join('\n');
   res.set('Content-Type', 'text/csv');
   res.set('Content-Disposition', 'attachment; filename="checkins.csv"');
