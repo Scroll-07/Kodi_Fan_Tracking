@@ -49,6 +49,13 @@ function appendEntry(entry) {
   });
   return writeQueue;
 }
+function resetEntries() {
+  writeQueue = writeQueue.then(() => {
+    fs.writeFileSync(DATA_FILE, '[]');
+    return [];
+  });
+  return writeQueue;
+}
 function getEntries() {
   return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
 }
@@ -234,6 +241,8 @@ app.get('/admin', requireAuth, (req, res) => {
   if (q.smsError === 'not_configured') banner = `<div class="banner err">SMS isn't set up yet — add TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_FROM_NUMBER in Railway Variables.</div>`;
   if (q.emailError === 'not_configured') banner = `<div class="banner err">Email isn't set up yet — add RESEND_API_KEY in Railway Variables.</div>`;
   if (q.smsError === 'empty' || q.emailError === 'empty') banner = `<div class="banner err">Message can't be empty.</div>`;
+  if (q.resetDone === '1') banner = `<div class="banner ok">All check-in data has been cleared.</div>`;
+  if (q.resetError === 'badpass') banner = `<div class="banner err">Incorrect admin password — data was NOT deleted.</div>`;
 
   res.send(`<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -259,6 +268,13 @@ app.get('/admin', requireAuth, (req, res) => {
   .panel textarea{min-height:90px;resize:vertical}
   .panel button{width:100%;padding:11px;border:none;border-radius:8px;background:#111;color:#fff;font-weight:600;font-size:.85rem;cursor:pointer}
   .panel button:hover{opacity:.9}
+  .danger{background:#fdf3f2;border:1px solid #f3c9c5;border-radius:12px;padding:18px;margin-top:28px}
+  .danger h3{margin:0 0 4px;font-size:.95rem;color:#a3231b}
+  .danger p.hint{margin:0 0 12px;font-size:.78rem;color:#8a4f4a}
+  .danger form{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  .danger input{padding:10px;border:1px solid #e3b3ae;border-radius:8px;font-size:.85rem;flex:1;min-width:180px}
+  .danger button{padding:11px 18px;border:none;border-radius:8px;background:#a3231b;color:#fff;font-weight:600;font-size:.85rem;cursor:pointer}
+  .danger button:hover{opacity:.9}
 </style></head>
 <body>
   <h1>${EVENT_NAME} — Check-Ins</h1>
@@ -288,6 +304,15 @@ app.get('/admin', requireAuth, (req, res) => {
         <button type="submit">Send Email to All</button>
       </form>
     </div>
+  </div>
+
+  <div class="danger">
+    <h3>Clear all check-in data</h3>
+    <p class="hint">Permanently deletes every check-in (including test entries). Cannot be undone. Requires your admin password to confirm.</p>
+    <form method="POST" action="/admin/reset" onsubmit="return confirm('This will permanently delete all ${entries.length} check-in entries. Are you sure?');">
+      <input type="password" name="confirmPassword" placeholder="Admin password" required>
+      <button type="submit">Clear All Data</button>
+    </form>
   </div>
 
   <table>
@@ -354,6 +379,15 @@ app.get('/admin/export.csv', requireAuth, (req, res) => {
   res.set('Content-Type', 'text/csv');
   res.set('Content-Disposition', 'attachment; filename="checkins.csv"');
   res.send(header + rows);
+});
+
+app.post('/admin/reset', requireAuth, async (req, res) => {
+  const confirmPassword = req.body.confirmPassword || '';
+  if (confirmPassword !== ADMIN_PASS) {
+    return res.redirect('/admin?resetError=badpass');
+  }
+  await resetEntries();
+  res.redirect('/admin?resetDone=1');
 });
 
 app.listen(PORT, () => console.log(`Event check-in app running on port ${PORT}`));
