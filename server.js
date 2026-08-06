@@ -3,6 +3,8 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const QRCode = require('qrcode');
+const twilio = require('twilio');
+const { Resend } = require('resend');
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
@@ -16,6 +18,18 @@ const PASS_PREFIX = process.env.PASS_PREFIX || 'CR';
 const PUBLIC_URL = process.env.PUBLIC_URL || `http://localhost:${PORT}`;
 const ADMIN_USER = process.env.ADMIN_USERNAME || 'admin';
 const ADMIN_PASS = process.env.ADMIN_PASSWORD || 'changeme';
+
+// SMS (Twilio) and Email (Resend) — both optional; features quietly no-op if unset
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
+const TWILIO_FROM_NUMBER = process.env.TWILIO_FROM_NUMBER;
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const RESEND_FROM_EMAIL = process.env.RESEND_FROM_EMAIL || 'onboarding@resend.dev';
+
+const twilioClient = (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN)
+  ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+  : null;
+const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
 
 // Railway Volume should be mounted at /data (see railway.toml)
 const DATA_DIR = process.env.DATA_DIR || '/data';
@@ -50,6 +64,33 @@ function requireAuth(req, res, next) {
   if (user === ADMIN_USER && pass === ADMIN_PASS) return next();
   res.set('WWW-Authenticate', 'Basic realm="Admin"');
   return res.status(401).send('Invalid credentials');
+}
+
+// ---- Messaging helpers ----
+// Normalizes to E.164. Assumes US (+1) for bare 10-digit numbers — adjust if you expect international guests.
+function normalizePhone(raw) {
+  if (!raw) return null;
+  const digits = raw.replace(/[^\d+]/g, '');
+  if (!digits) return null;
+  if (digits.startsWith('+')) return digits;
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`;
+  return `+${digits}`;
+}
+
+async function sendConfirmationSMS(phone, name) {
+  if (!twilioClient || !phone) return;
+  const to = normalizePhone(phone);
+  if (!to) return;
+  try {
+    await twilioClient.messages.create({
+      body: `You're checked in for ${EVENT_NAME}, ${name.split(' ')[0]}! We'll text the address as showtime gets closer.`,
+      from: TWILIO_FROM_NUMBER,
+      to
+    });
+  } catch (err) {
+    console.error('Confirmation SMS failed:', err.message);
+  }
 }
 
 // ---- Routes ----
@@ -137,6 +178,8 @@ app.post('/checkin', async (req, res) => {
     timestamp: new Date().toISOString()
   });
 
+  sendConfirmationSMS(phone, name); // fire-and-forget — don't hold up the response for it
+
   res.send(`<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Checked In — ${EVENT_NAME}</title>
@@ -179,35 +222,127 @@ app.get('/qr', async (req, res) => {
 app.get('/admin', requireAuth, (req, res) => {
   const entries = getEntries().slice().reverse();
   const uniqueEmails = new Set(entries.map(e => e.email)).size;
+  const phoneCount = new Set(entries.filter(e => e.phone).map(e => normalizePhone(e.phone))).size;
   const rows = entries.map(e =>
     `<tr><td>${e.name}</td><td>${e.email}</td><td>${e.phone || ''}</td><td>${new Date(e.timestamp).toLocaleString()}</td></tr>`
   ).join('');
+
+  const q = req.query;
+  let banner = '';
+  if (q.smsSent !== undefined) banner = `<div class="banner ok">SMS sent to ${q.smsSent} people${q.smsFailed > 0 ? `, ${q.smsFailed} failed` : ''}.</div>`;
+  if (q.emailSent !== undefined) banner = `<div class="banner ok">Email sent to ${q.emailSent} people${q.emailFailed > 0 ? `, ${q.emailFailed} failed` : ''}.</div>`;
+  if (q.smsError === 'not_configured') banner = `<div class="banner err">SMS isn't set up yet — add TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_FROM_NUMBER in Railway Variables.</div>`;
+  if (q.emailError === 'not_configured') banner = `<div class="banner err">Email isn't set up yet — add RESEND_API_KEY in Railway Variables.</div>`;
+  if (q.smsError === 'empty' || q.emailError === 'empty') banner = `<div class="banner err">Message can't be empty.</div>`;
 
   res.send(`<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${EVENT_NAME} — Admin</title>
 <style>
   body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:900px;margin:30px auto;padding:0 20px;color:#1a1a1a}
-  .stats{display:flex;gap:16px;margin-bottom:20px}
+  .stats{display:flex;gap:16px;margin-bottom:20px;flex-wrap:wrap}
   .stat{background:#f5f5f5;border-radius:10px;padding:16px 20px}
   .stat .num{font-size:1.8rem;font-weight:700}
   .stat .label{color:#666;font-size:.85rem}
-  table{width:100%;border-collapse:collapse;font-size:.9rem}
+  table{width:100%;border-collapse:collapse;font-size:.9rem;margin-top:24px}
   th,td{text-align:left;padding:8px;border-bottom:1px solid #eee}
   a.btn{display:inline-block;margin-bottom:16px;padding:8px 14px;background:#111;color:#fff;border-radius:8px;text-decoration:none;font-size:.85rem}
+  .banner{padding:12px 16px;border-radius:8px;margin-bottom:20px;font-size:.9rem}
+  .banner.ok{background:#e8f7ee;color:#1a7a3f}
+  .banner.err{background:#fdecec;color:#a3231b}
+  .broadcast-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:8px}
+  @media (max-width:700px){.broadcast-grid{grid-template-columns:1fr}}
+  .panel{background:#f9f9f7;border:1px solid #e5e3dc;border-radius:12px;padding:18px}
+  .panel h3{margin:0 0 4px;font-size:.95rem}
+  .panel p.hint{margin:0 0 12px;font-size:.78rem;color:#777}
+  .panel input, .panel textarea{width:100%;padding:10px;border:1px solid #ddd;border-radius:8px;font-family:inherit;font-size:.88rem;margin-bottom:10px;box-sizing:border-box}
+  .panel textarea{min-height:90px;resize:vertical}
+  .panel button{width:100%;padding:11px;border:none;border-radius:8px;background:#111;color:#fff;font-weight:600;font-size:.85rem;cursor:pointer}
+  .panel button:hover{opacity:.9}
 </style></head>
 <body>
   <h1>${EVENT_NAME} — Check-Ins</h1>
+  ${banner}
   <div class="stats">
     <div class="stat"><div class="num">${entries.length}</div><div class="label">Total check-ins</div></div>
     <div class="stat"><div class="num">${uniqueEmails}</div><div class="label">Unique people</div></div>
+    <div class="stat"><div class="num">${phoneCount}</div><div class="label">Phone numbers on file</div></div>
   </div>
   <a class="btn" href="/admin/export.csv">Download CSV</a>
+
+  <div class="broadcast-grid">
+    <div class="panel">
+      <h3>Send SMS to everyone</h3>
+      <p class="hint">Goes to every phone number logged (${phoneCount} people). Good for the address, day-of.</p>
+      <form method="POST" action="/admin/broadcast/sms">
+        <textarea name="message" placeholder="e.g. Tonight's address: 123 Main St, Atlanta. Doors at 9pm." required></textarea>
+        <button type="submit">Send SMS to All</button>
+      </form>
+    </div>
+    <div class="panel">
+      <h3>Send email to everyone</h3>
+      <p class="hint">Goes to every email logged (${uniqueEmails} people), sent via Resend.</p>
+      <form method="POST" action="/admin/broadcast/email">
+        <input type="text" name="subject" placeholder="Subject (e.g. Tonight's location)">
+        <textarea name="message" placeholder="Message body..." required></textarea>
+        <button type="submit">Send Email to All</button>
+      </form>
+    </div>
+  </div>
+
   <table>
     <tr><th>Name</th><th>Email</th><th>Phone</th><th>Time</th></tr>
     ${rows}
   </table>
 </body></html>`);
+});
+
+app.post('/admin/broadcast/sms', requireAuth, async (req, res) => {
+  const message = (req.body.message || '').trim();
+  if (!message) return res.redirect('/admin?smsError=empty');
+  if (!twilioClient) return res.redirect('/admin?smsError=not_configured');
+
+  const entries = getEntries();
+  const recipients = [...new Set(entries.filter(e => e.phone).map(e => normalizePhone(e.phone)).filter(Boolean))];
+
+  let sent = 0, failed = 0;
+  for (const to of recipients) {
+    try {
+      await twilioClient.messages.create({ body: message, from: TWILIO_FROM_NUMBER, to });
+      sent++;
+    } catch (err) {
+      failed++;
+      console.error('Broadcast SMS failed for', to, err.message);
+    }
+  }
+  res.redirect(`/admin?smsSent=${sent}&smsFailed=${failed}`);
+});
+
+app.post('/admin/broadcast/email', requireAuth, async (req, res) => {
+  const message = (req.body.message || '').trim();
+  const subject = (req.body.subject || `${EVENT_NAME} — Update`).trim();
+  if (!message) return res.redirect('/admin?emailError=empty');
+  if (!resend) return res.redirect('/admin?emailError=not_configured');
+
+  const entries = getEntries();
+  const recipients = [...new Set(entries.map(e => e.email))];
+
+  let sent = 0, failed = 0;
+  for (const to of recipients) {
+    try {
+      await resend.emails.send({
+        from: RESEND_FROM_EMAIL,
+        to,
+        subject,
+        html: `<p>${message.replace(/\n/g, '<br>')}</p>`
+      });
+      sent++;
+    } catch (err) {
+      failed++;
+      console.error('Broadcast email failed for', to, err.message);
+    }
+  }
+  res.redirect(`/admin?emailSent=${sent}&emailFailed=${failed}`);
 });
 
 app.get('/admin/export.csv', requireAuth, (req, res) => {
