@@ -89,7 +89,7 @@ async function sendConfirmationSMS(phone, name) {
       to
     });
   } catch (err) {
-    console.error('Confirmation SMS failed:', err.message);
+    console.error(`Confirmation SMS failed for ${to}:`, err.message);
   }
 }
 
